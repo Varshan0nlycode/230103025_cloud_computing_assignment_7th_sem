@@ -1,0 +1,436 @@
+name: Test Kubernetes Deployment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kubernetes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.4
+
+      - name: Install k3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh \
+            -o /tmp/install-k3d.sh
+          bash /tmp/install-k3d.sh
+          k3d version
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t cs3081-api:v1 \
+            -f service/Dockerfile .
+
+          docker image ls cs3081-api:v1
+
+      - name: Create Kubernetes cluster
+        run: |
+          k3d cluster create \
+            --config cluster/k3d.yaml
+
+          kubectl get nodes
+
+      - name: Import Docker image into k3d
+        run: |
+          k3d image import cs3081-api:v1 \
+            --cluster cs3081
+
+      - name: Deploy application
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+          kubectl get deployments,pods,services,ingress \
+            -n app
+
+      - name: Wait for two replicas
+        shell: bash
+        run: |
+          kubectl rollout status \
+            deployment/command-parser \
+            -n app \
+            --timeout=300s
+
+          kubectl wait \
+            --for=condition=Ready pod \
+            -l app=command-parser \
+            -n app \
+            --timeout=300s
+
+          READY=$(kubectl get pods -n app \
+            -l app=command-parser \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' \
+            | grep -c '^true$' || true)
+
+          echo "Ready replicas: $READY"
+
+          if [ "$READY" -ne 2 ]; then
+            echo "Expected exactly two ready replicas"
+            exit 1
+          fi
+
+      - name: Verify HPA
+        run: |
+          kubectl get hpa -n app
+          kubectl describe hpa command-parser-hpa -n app
+
+      - name: Test HPA scaling
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Scale down to one replica ==="
+          kubectl scale deployment command-parser \
+            --replicas=1 -n app
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=180s
+
+          echo "=== Generate CPU load ==="
+          POD=$(kubectl get pods -n app \
+            -l app=command-parser \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl exec -n app "$POD" -- \
+            python -c '
+          import hashlib, time
+          end = time.monotonic() + 180
+          data = b"cs3081-load"
+          while time.monotonic() < end:
+              data = hashlib.sha256(data).digest()
+          ' &
+
+          LOAD_PID=$!
+
+          echo "=== Monitor HPA ==="
+          for i in $(seq 1 15); do
+            kubectl get hpa -n app
+            kubectl get deployment command-parser -n app
+            sleep 15
+          done
+
+          wait "$LOAD_PID" || true
+
+          echo "=== Final HPA state ==="
+          kubectl get hpa -n app
+          kubectl get pods -n app
+
+      - name: Test API through Ingress
+        shell: bash
+        run: |
+          set -e
+
+          for i in $(seq 1 30); do
+            STATUS=$(curl -sS \
+              -o /tmp/response.json \
+              -w '%{http_code}' \
+              -X POST \
+              http://127.0.0.1:8080/parse \
+              -H "Content-Type: application/json" \
+              -d '{"text":"set an alarm for seven am tomorrow"}' \
+              || true)
+
+            if [ "$STATUS" = "200" ]; then
+              echo "Ingress returned HTTP 200"
+              cat /tmp/response.json
+              break
+            fi
+
+            echo "Attempt $i returned $STATUS"
+            sleep 3
+          done
+
+          test "$STATUS" = "200"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(
+              Path("/tmp/response.json").read_text()
+          )
+
+          assert set(result) == {
+              "intent", "date", "time", "place"
+          }
+
+          assert result["intent"] == "alarm_set"
+
+          print("PASS: Kubernetes API working!")
+          PY
+
+      - name: Test rolling update and rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Disable HPA ==="
+          kubectl delete hpa command-parser-hpa \
+            -n app --ignore-not-found
+
+          echo "=== Update v1 to v2 ==="
+          kubectl set env deployment/command-parser \
+            -n app MODEL_VERSION=v2
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          echo "=== Verify v2 ==="
+          verify_version() {
+            local expected="$1"
+            local success=0
+
+            for i in $(seq 1 30); do
+              status=$(curl -sS \
+                --max-time 30 \
+                -D /tmp/model-headers.txt \
+                -o /tmp/model-response.json \
+                -w '%{http_code}' \
+                -X POST http://127.0.0.1:8080/parse \
+                -H "Content-Type: application/json" \
+                -d '{"text":"set an alarm for seven am tomorrow"}' \
+                || true)
+
+              if [ "$status" = "200" ] && \
+                 grep -iq "x-model-version: $expected" \
+                   /tmp/model-headers.txt; then
+                echo "PASS: $expected responded correctly"
+                success=1
+                break
+              fi
+
+              echo "Attempt $i: HTTP $status"
+              sleep 3
+            done
+
+            if [ "$success" -ne 1 ]; then
+              echo "ERROR: $expected verification failed"
+              kubectl get pods,endpoints -n app
+              kubectl logs -n app \
+                -l app=command-parser \
+                --tail=60 --prefix=true \
+                --max-log-requests=10 || true
+              return 1
+            fi
+          }
+
+          verify_version v2
+
+          echo "=== Roll back to v1 ==="
+          kubectl rollout undo deployment/command-parser \
+            -n app
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          echo "=== Verify v1 ==="
+          verify_version v1
+
+          echo "PASS: Rolling update and rollback completed!"
+
+      - name: Test Pod recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Set deployment to 2 replicas ==="
+          kubectl scale deployment/command-parser \
+            --replicas=2 -n app
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          echo "=== Delete one Pod ==="
+          POD=$(kubectl get pods -n app \
+            -l app=command-parser \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Deleting Pod: $POD"
+          kubectl delete pod "$POD" -n app
+
+          echo "=== Wait for recovery ==="
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          kubectl wait \
+            --for=condition=Ready pod \
+            -l app=command-parser \
+            -n app --timeout=300s
+
+          echo "=== Verify replica count ==="
+          kubectl get pods -n app
+
+          READY=$(kubectl get deployment \
+            command-parser -n app \
+            -o jsonpath='{.status.readyReplicas}')
+
+          test "$READY" = "2"
+
+          echo "PASS: Kubernetes restored 2 ready replicas!"
+
+      - name: Test load balancing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Ensure 2 Ready replicas ==="
+          kubectl scale deployment/command-parser \
+            --replicas=2 -n app
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          echo "=== Send 40 requests ==="
+
+          python3 - <<'PY'
+          import json
+          import urllib.request
+          from collections import Counter
+
+          counts = Counter()
+          failures = 0
+
+          for i in range(40):
+              data = json.dumps({
+                  "text": "set an alarm for seven am tomorrow"
+              }).encode()
+
+              req = urllib.request.Request(
+                  "http://127.0.0.1:8080/parse",
+                  data=data,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      req, timeout=30
+                  ) as response:
+                      pod = response.headers.get("X-Served-By")
+                      counts[pod] += 1
+              except Exception as e:
+                  failures += 1
+                  print(f"Request {i + 1} failed: {e}")
+
+          total = sum(counts.values())
+
+          print("=== Requests per Pod ===")
+          for pod, count in counts.items():
+              print(f"{pod}: {count} requests")
+
+          print(f"Successful: {total}")
+          print(f"Failed: {failures}")
+
+          assert failures == 0
+          assert len(counts) == 2
+
+          for count in counts.values():
+              assert count / total >= 0.30
+
+          print("PASS: Both replicas served at least 30%!")
+          PY
+
+      - name: Run Locust performance test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install "locust==2.32.6" "charset-normalizer==3.4.2"
+
+          mkdir -p results
+
+          echo "=== Ensure two ready replicas ==="
+          kubectl scale deployment/command-parser \
+            --replicas=2 -n app
+
+          kubectl rollout status deployment/command-parser \
+            -n app --timeout=300s
+
+          echo "=== Start performance test ==="
+          locust \
+            -f tools/locustfile.py \
+            --headless \
+            --users 4 \
+            --spawn-rate 4 \
+            --run-time 2m \
+            --host http://127.0.0.1:8080 \
+            --csv results/loadtest \
+            --exit-code-on-error 0
+
+          echo "=== Pod resource consumption ==="
+          kubectl top pods -n app \
+            > results/pod-resources.txt 2>&1 || true
+
+          echo "=== Load test summary ==="
+          cat results/loadtest_stats.csv
+
+          echo "=== Request distribution ==="
+          cat results/loadtest_headers.json || true
+
+      - name: Save cluster evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p results/kubernetes
+
+          kubectl get nodes -o wide \
+            > results/kubernetes/nodes.txt 2>&1 || true
+
+          kubectl get pods -n app -o wide \
+            > results/kubernetes/pods.txt 2>&1 || true
+
+          kubectl get all,ingress -n app \
+            > results/kubernetes/resources.txt 2>&1 || true
+
+          kubectl describe pods -n app \
+            > results/kubernetes/pod-details.txt 2>&1 || true
+
+          kubectl get pods,services,endpoints -n app -o wide \
+            > results/kubernetes/load-balancing-state.txt 2>&1 || true
+
+          kubectl logs -n app \
+            -l app=command-parser \
+            --all-containers=true \
+            --prefix=true \
+            --max-log-requests=10 \
+            > results/kubernetes/app-logs.txt 2>&1 || true
+
+          kubectl describe hpa command-parser-hpa -n app \
+            > results/kubernetes/hpa-details.txt 2>&1 || true
+
+          if [ -f /tmp/response.json ]; then
+            cp /tmp/response.json \
+              results/kubernetes/response.json
+          fi
+
+      - name: Upload Kubernetes evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-evidence
+          path: |
+            results/kubernetes/
+            results/loadtest*
+            results/pod-resources.txt
+          if-no-files-found: warn
+
+      - name: Delete cluster
+        if: always()
+        run: |
+          k3d cluster delete cs3081 || true
