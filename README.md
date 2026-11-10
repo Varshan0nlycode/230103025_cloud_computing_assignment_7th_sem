@@ -1,4 +1,4 @@
-# CS4032 Cloud Computing Mini Project
+# CS4032 Cloud Computing Project
 
 ## Project Title
 **Knowledge Distillation and Cloud Deployment of a Lightweight Language Model for Command Parsing**
