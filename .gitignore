@@ -20,7 +20,8 @@ venv/
 # Model training output
 checkpoints/
 outputs/
-
+models/
+models_output/
 # macOS
 .DS_Store
 
