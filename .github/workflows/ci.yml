@@ -130,6 +130,7 @@ jobs:
 
   secret-scan:
     needs: model-evaluation
+    if: always() && needs.model-evaluation.result != 'cancelled'
     runs-on: ubuntu-latest
 
     steps:
